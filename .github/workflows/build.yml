@@ -18,14 +18,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ========== 步骤1：安装系统依赖（含完整编译工具链） ==========
-      - name: 安装系统依赖与编译工具链
+      # ========== 步骤1：安装系统依赖与完整编译工具链 ==========
+      - name: 安装系统依赖
         run: |
           set -ex
           sed -i 's/ports.ubuntu.com/mirrors.aliyun.com/g' /etc/apt/sources.list
           apt-get update -qq
           
-          # 核心编译依赖：gcc/g++、make、patchelf、strip
+          # 安装完整编译依赖（gcc/g++、make、patchelf、strip）
           apt-get install -y -qq --no-install-recommends \
             tzdata \
             python3 python3-pip python3-tk python3-dev \
@@ -49,22 +49,22 @@ jobs:
           python3 -m pip install --upgrade pip
           pip3 config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
           
-          # 安装 Nuitka（最新稳定版）及所有运行时依赖
+          # 安装 Nuitka 及所有运行时依赖
           pip3 install nuitka pandas openpyxl numpy ordered-set zstandard
           
-          # 验证 Nuitka 安装
+          # 验证 Nuitka 版本
           python3 -m nuitka --version
 
-      # ========== 步骤3：注入反逆向 C 扩展模块（核心防护层）==========
-      - name: 编译反调试 C 扩展模块
+      # ========== 步骤3：编译反调试 C 扩展模块 ==========
+      - name: 编译反调试 C 扩展
         run: |
           set -ex
           PY_FILE=$(ls *.py | head -n 1)
           echo "检测到主文件：$PY_FILE"
           
-          # 创建反调试 C 扩展源码
           mkdir -p anti_reverse
           
+          # 创建反调试 C 扩展源码
           cat > anti_reverse/_anti_debug.c << 'ANTIDEBUG_C'
           #define PY_SSIZE_T_CLEAN
           #include <Python.h>
@@ -73,11 +73,9 @@ jobs:
           #include <string.h>
           #include <unistd.h>
           #include <sys/ptrace.h>
-          #include <sys/wait.h>
-          #include <signal.h>
           #include <time.h>
           
-          /* 反调试：检测 TracerPid */
+          /* 检测 TracerPid */
           static int check_tracer(void) {
               char path[64], buf[256];
               snprintf(path, sizeof(path), "/proc/%d/status", getpid());
@@ -95,42 +93,32 @@ jobs:
               return traced;
           }
           
-          /* 反调试：ptrace 自跟踪 */
+          /* ptrace 自跟踪检测 */
           static int self_ptrace(void) {
               if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) == -1) {
-                  /* 已被调试 */
                   return 1;
               }
               return 0;
           }
           
-          /* 反时间分析 */
+          /* 反时间分析：随机延迟 */
           static void anti_timing(void) {
               struct timespec ts;
               ts.tv_sec = 0;
-              ts.tv_nsec = (rand() % 5000000) + 1000000; /* 1-6ms 随机延迟 */
+              ts.tv_nsec = (rand() % 5000000) + 1000000;
               nanosleep(&ts, NULL);
           }
           
-          /* 模块初始化时执行所有检查 */
-          static int anti_debug_initialized = 0;
-          
           static PyObject* anti_debug_init(PyObject *self, PyObject *args) {
-              if (anti_debug_initialized) {
-                  Py_RETURN_NONE;
-              }
               srand((unsigned)time(NULL) ^ getpid());
               anti_timing();
-              
               if (check_tracer()) {
-                  /* 静默退出，不暴露检测逻辑 */
                   _exit(1);
               }
               if (self_ptrace()) {
                   _exit(1);
               }
               anti_timing();
-              anti_debug_initialized = 1;
               Py_RETURN_NONE;
           }
           
@@ -150,40 +138,32 @@ jobs:
           PyMODINIT_FUNC PyInit__anti_debug(void) {
               PyObject *m = PyModule_Create(&anti_debug_module);
               if (m == NULL) return NULL;
-              /* 模块加载时立即执行检测 */
               anti_debug_init(NULL, NULL);
               return m;
           }
           ANTIDEBUG_C
           
-          # 创建 setup.py 编译 C 扩展
+          # 编译 C 扩展
           cat > anti_reverse/setup.py << 'SETUP_PY'
           from setuptools import setup, Extension
-          
           module = Extension(
               '_anti_debug',
               sources=['_anti_debug.c'],
               extra_compile_args=['-O3', '-fPIC', '-s', '-D_FORTIFY_SOURCE=2'],
           )
-          
-          setup(
-              name='anti_debug',
-              version='1.0',
-              ext_modules=[module],
-          )
+          setup(name='anti_debug', version='1.0', ext_modules=[module])
           SETUP_PY
           
-          # 编译 C 扩展
           cd anti_reverse
           python3 setup.py build_ext --inplace
           cd ..
           
           # 复制编译好的 .so 到工作目录
-          cp anti_reverse/_anti_debug*.so ./
-          ls -la _anti_debug*.so
+          cp anti_reverse/_anti_debug*.so ./_anti_debug.so
+          ls -la _anti_debug.so
 
-      # ========== 步骤4：创建带反逆向注入的入口包装器 ==========
-      - name: 创建受保护的入口文件
+      # ========== 步骤4：创建受保护的入口包装器 ==========
+      - name: 创建入口包装器
         run: |
           set -ex
           PY_FILE=$(ls *.py | grep -v "^_" | head -n 1)
@@ -191,97 +171,91 @@ jobs:
           
           # 创建入口包装器：最先导入反调试模块
           cat > _entry_protected.py << 'ENTRY'
-          # nuitka-project: --mode=standalone
-          # nuitka-project: --enable-plugin=tk-inter
-          # nuitka-project: --include-package=pandas
-          # nuitka-project: --include-package=openpyxl
-          # nuitka-project: --include-package=numpy
-          # nuitka-project: --noinclude-pytest-mode=nofollow
-          # nuitka-project: --noinclude-setuptools-mode=nofollow
-          
           import _anti_debug  # C 扩展：最先加载，触发反调试检测
           import sys
           import os
           
-          # 运行时完整性校验（简单版）
+          # 运行时环境检测
           def _verify_env():
-              """检测常见逆向分析环境"""
-              suspicious = ['gdb', 'ltrace', 'strace', 'radare2', 'ghidra']
-              parent_cmd = open(f'/proc/{os.getppid()}/comm', 'r').read().strip() if os.path.exists(f'/proc/{os.getppid()}/comm') else ''
-              if any(s in parent_cmd.lower() for s in suspicious):
-                  os._exit(1)
+              suspicious = ['gdb', 'ltrace', 'strace', 'radare2', 'ghidra', 'ida']
+              try:
+                  parent_cmd = open(f'/proc/{os.getppid()}/comm', 'r').read().strip()
+                  if any(s in parent_cmd.lower() for s in suspicious):
+                      os._exit(1)
+              except:
+                  pass
           
           _verify_env()
           
-          # 延迟导入主程序（绕过静态分析时的符号解析）
+          # 动态导入原主程序
           import importlib.util
-          spec = importlib.util.spec_from_file_location("main", os.path.join(os.path.dirname(__file__), "__main__.py"))
+          main_path = os.path.join(os.path.dirname(__file__), "__main__.py")
+          spec = importlib.util.spec_from_file_location("main", main_path)
           main_module = importlib.util.module_from_spec(spec)
           sys.modules["main"] = main_module
           spec.loader.exec_module(main_module)
           ENTRY
           
-          # 复制原文件为 __main__.py（供动态导入）
+          # 复制原文件为 __main__.py
           cp "$PY_FILE" __main__.py
           
           echo "入口包装器创建完成"
 
-      # ========== 步骤5：Nuitka 原生编译（核心步骤）==========
+      # ========== 步骤5：Nuitka 原生编译（修正参数）==========
       - name: Nuitka 编译
         run: |
           set -ex
           
-          # Nuitka 编译参数说明：
-          # --mode=standalone: 独立分发模式，包含所有依赖
-          # --enable-plugin=tk-inter: tkinter GUI 支持
-          # --lto=yes: 链接时优化，提升性能并增加分析难度
-          # --strip: 剥离符号表
-          # --remove-output: 清理中间文件
-          # --no-pyi-file: 不生成 .pyi 存根文件
-          # --jobs=4: 并行编译加速
+          # 关键修正：
+          # 1. 删除 --strip（Nuitka 默认自动 strip，用 --unstripped 可保留）
+          # 2. --include-module 对 C 扩展无效，改用 --include-data-files 嵌入 .so
+          # 3. 使用 --output-dir 指定输出目录，编译后重命名
           
           python3 -m nuitka \
             --mode=standalone \
             --enable-plugin=tk-inter \
-            --include-module=_anti_debug \
-            --include-module=pandas \
-            --include-module=openpyxl \
-            --include-module=numpy \
-            --include-data-files=_anti_debug*.so=. \
+            --include-package=pandas \
+            --include-package=openpyxl \
+            --include-package=numpy \
+            --include-data-files=_anti_debug.so=_anti_debug.so \
+            --include-data-files=__main__.py=__main__.py \
             --lto=yes \
-            --strip \
             --remove-output \
             --no-pyi-file \
             --jobs=4 \
             --output-dir=nuitka_build \
-            --output-filename=轻松评 \
             _entry_protected.py
           
           echo "Nuitka 编译完成"
-          ls -la nuitka_build/轻松评.dist/
+          
+          # 重命名输出文件
+          mv nuitka_build/_entry_protected.dist nuitka_build/轻松评.dist 2>/dev/null || true
+          mv nuitka_build/_entry_protected.bin nuitka_build/轻松评 2>/dev/null || true
+          
+          ls -la nuitka_build/
 
-      # ========== 步骤6：二进制加固与反逆向处理 ==========
+      # ========== 步骤6：二进制加固（strip 由 Nuitka 自动完成，此处做额外处理）==========
       - name: 二进制加固
         run: |
           set -ex
           DIST_DIR="nuitka_build/轻松评.dist"
           
-          # 1. 剥离所有 .so 文件的符号
+          # 1. 手动 strip 所有 .so 文件（Nuitka 只 strip 主二进制）
           find "$DIST_DIR" -name "*.so" -exec strip --strip-all {} + 2>/dev/null || true
           
-          # 2. 使用 patchelf 修改 RPATH（防止库劫持）
-          if [ -f "$DIST_DIR/轻松评" ]; then
-            patchelf --set-rpath '$ORIGIN' "$DIST_DIR/轻松评" 2>/dev/null || true
+          # 2. 使用 patchelf 修改 RPATH，防止库劫持
+          if [ -f "$DIST_DIR/_entry_protected" ]; then
+            patchelf --set-rpath '$ORIGIN' "$DIST_DIR/_entry_protected" 2>/dev/null || true
+            # 重命名为中文名
+            mv "$DIST_DIR/_entry_protected" "$DIST_DIR/轻松评"
           fi
           
-          # 3. UPX 压缩主二进制（可选，增加体积但提升分析难度）
-          # 注意：Nuitka 生成的二进制较大，UPX 可能效果有限
+          # 3. UPX 压缩主二进制（可选）
           if command -v upx &> /dev/null && [ -f "$DIST_DIR/轻松评" ]; then
             upx --best --lzma "$DIST_DIR/轻松评" 2>/dev/null || echo "UPX 压缩跳过"
           fi
           
-          # 4. 重命名关键库文件（增加分析难度）
-          # 将 libpython 等关键库改名，并在启动脚本中建立符号链接
+          # 4. 混淆关键库文件名（增加分析难度）
           PYTHON_SO=$(find "$DIST_DIR" -name "libpython3*.so*" | head -n 1)
           if [ -n "$PYTHON_SO" ]; then
             BASENAME=$(basename "$PYTHON_SO")
@@ -296,11 +270,11 @@ jobs:
       - name: 完善分发包
         run: |
           set -ex
-          DIST_DIR="nuitka_build/轻松评.dist"
+          SRC_DIR="nuitka_build/轻松评.dist"
           OUTPUT_DIR="dist/轻松评"
           
           mkdir -p "$OUTPUT_DIR"
-          cp -r "$DIST_DIR"/* "$OUTPUT_DIR/"
+          cp -r "$SRC_DIR"/* "$OUTPUT_DIR/"
           
           # 复制可能缺失的系统库
           mkdir -p "$OUTPUT_DIR/lib"
@@ -317,13 +291,12 @@ jobs:
             find /usr/lib -name "${lib}.so.*" -exec cp {} "$OUTPUT_DIR/lib/" \; 2>/dev/null || true
           done
           
-          # 生成启动脚本（带库路径设置）
+          # 生成启动脚本
           cat > "$OUTPUT_DIR/run.sh" << "RUN_SCRIPT"
           #!/bin/bash
           DIR="$(cd "$(dirname "$0")" && pwd)"
           export LD_LIBRARY_PATH="$DIR/lib:$DIR:$LD_LIBRARY_PATH"
           export PYTHONPATH="$DIR:$PYTHONPATH"
-          # 反调试环境变量标记
           export _ANTI_DEBUG=1
           exec "$DIR/轻松评" "$@"
           RUN_SCRIPT
