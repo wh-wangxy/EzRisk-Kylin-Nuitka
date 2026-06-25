@@ -18,25 +18,39 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ========== 步骤1：安装系统依赖 ==========
+      # ========== 步骤1：安装系统依赖（官方源 + 重试机制）==========
       - name: 安装系统依赖
         run: |
           set -ex
-          sed -i 's/ports.ubuntu.com/mirrors.aliyun.com/g' /etc/apt/sources.list
-          apt-get update -qq
-          
-          apt-get install -y -qq --no-install-recommends \
-            tzdata \
-            python3 python3-pip python3-tk python3-dev \
-            python3-setuptools python3-wheel \
-            clang lld \
-            binutils file patchelf \
-            libopenblas-base liblzma5 libbz2-1.0 libreadline8 \
-            libsqlite3-0 libncursesw6 libtinfo6 \
-            libffi-dev libssl-dev \
-            git \
-            upx-ucl
-          
+          # 使用官方源（GitHub Actions 网络环境下官方源通常更稳定）
+          # 清除可能存在的第三方源配置
+          rm -f /etc/apt/sources.list.d/*.list 2>/dev/null || true
+
+          # 多次更新重试
+          for i in 1 2 3; do
+            apt-get update -qq && break
+            echo "apt update 失败，重试 $i/3..."
+            sleep 5
+          done
+
+          # 安装依赖（带 --fix-missing 和重试）
+          for i in 1 2 3; do
+            apt-get install -y -qq --no-install-recommends --fix-missing \
+              tzdata \
+              python3 python3-pip python3-tk python3-dev \
+              python3-setuptools python3-wheel \
+              clang lld \
+              binutils file patchelf \
+              libopenblas-base liblzma5 libbz2-1.0 libreadline8 \
+              libsqlite3-0 libncursesw6 libtinfo6 \
+              libffi-dev libssl-dev \
+              git \
+              upx-ucl && break
+            echo "apt install 失败，重试 $i/3..."
+            sleep 10
+          done
+
+          # 配置时区
           ln -fs /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
           dpkg-reconfigure -f noninteractive tzdata 2>/dev/null || true
           clang --version
@@ -56,9 +70,9 @@ jobs:
           set -ex
           PY_FILE=$(ls *.py | head -n 1)
           echo "检测到主文件：$PY_FILE"
-          
+
           mkdir -p anti_reverse
-          
+
           cat > anti_reverse/_anti_debug.c << 'ANTIDEBUG_C'
           #define PY_SSIZE_T_CLEAN
           #include <Python.h>
@@ -68,7 +82,7 @@ jobs:
           #include <unistd.h>
           #include <sys/ptrace.h>
           #include <time.h>
-          
+
           static int check_tracer(void) {
               char path[64], buf[256];
               snprintf(path, sizeof(path), "/proc/%d/status", getpid());
@@ -85,21 +99,21 @@ jobs:
               fclose(fp);
               return traced;
           }
-          
+
           static int self_ptrace(void) {
               if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) == -1) {
                   return 1;
               }
               return 0;
           }
-          
+
           static void anti_timing(void) {
               struct timespec ts;
               ts.tv_sec = 0;
               ts.tv_nsec = (rand() % 5000000) + 1000000;
               nanosleep(&ts, NULL);
           }
-          
+
           static PyObject* anti_debug_init(PyObject *self, PyObject *args) {
               srand((unsigned)time(NULL) ^ getpid());
               anti_timing();
@@ -112,12 +126,12 @@ jobs:
               anti_timing();
               Py_RETURN_NONE;
           }
-          
+
           static PyMethodDef AntiDebugMethods[] = {
               {"init", anti_debug_init, METH_NOARGS, "Initialize anti-debug protection"},
               {NULL, NULL, 0, NULL}
           };
-          
+
           static struct PyModuleDef anti_debug_module = {
               PyModuleDef_HEAD_INIT,
               "_anti_debug",
@@ -125,7 +139,7 @@ jobs:
               -1,
               AntiDebugMethods
           };
-          
+
           PyMODINIT_FUNC PyInit__anti_debug(void) {
               PyObject *m = PyModule_Create(&anti_debug_module);
               if (m == NULL) return NULL;
@@ -133,7 +147,7 @@ jobs:
               return m;
           }
           ANTIDEBUG_C
-          
+
           cat > anti_reverse/setup.py << 'SETUP_PY'
           from setuptools import setup, Extension
           module = Extension(
@@ -143,12 +157,11 @@ jobs:
           )
           setup(name='anti_debug', version='1.0', ext_modules=[module])
           SETUP_PY
-          
+
           cd anti_reverse
           CC=clang LDSHARED="clang -shared" python3 setup.py build_ext --inplace
           cd ..
-          
-          # 将编译好的 .so 复制到工作目录根，确保 Nuitka 能自动发现
+
           cp anti_reverse/_anti_debug*.so ./_anti_debug.so
           ls -la _anti_debug.so
 
@@ -158,12 +171,12 @@ jobs:
           set -ex
           PY_FILE=$(ls *.py | grep -v "^_" | head -n 1)
           echo "主文件：$PY_FILE"
-          
+
           cat > _entry_protected.py << 'ENTRY'
           import _anti_debug
           import sys
           import os
-          
+
           def _verify_env():
               suspicious = ['gdb', 'ltrace', 'strace', 'radare2', 'ghidra', 'ida']
               try:
@@ -172,9 +185,9 @@ jobs:
                       os._exit(1)
               except:
                   pass
-          
+
           _verify_env()
-          
+
           import importlib.util
           main_path = os.path.join(os.path.dirname(__file__), "__main__.py")
           spec = importlib.util.spec_from_file_location("main", main_path)
@@ -182,20 +195,15 @@ jobs:
           sys.modules["main"] = main_module
           spec.loader.exec_module(main_module)
           ENTRY
-          
+
           cp "$PY_FILE" __main__.py
           echo "入口包装器创建完成"
 
-      # ========== 步骤5：Nuitka 编译（删除冲突的 --include-data-files）==========
+      # ========== 步骤5：Nuitka 编译 ==========
       - name: Nuitka 编译
         run: |
           set -ex
-          
-          # 关键修正：
-          # 1. 删除 --include-data-files=_anti_debug.so（Nuitka 自动打包 C 扩展，与 data-files 冲突）
-          # 2. 保留 --include-module=_anti_debug 让 Nuitka 显式包含该模块
-          # 3. __main__.py 仍需作为数据文件嵌入
-          
+
           python3 -m nuitka \
             --mode=standalone \
             --enable-plugin=tk-inter \
@@ -212,9 +220,9 @@ jobs:
             --jobs=1 \
             --output-dir=nuitka_build \
             _entry_protected.py
-          
+
           echo "Nuitka 编译完成"
-          
+
           mv nuitka_build/_entry_protected.dist nuitka_build/轻松评.dist 2>/dev/null || true
           mv nuitka_build/_entry_protected.bin nuitka_build/轻松评 2>/dev/null || true
           ls -la nuitka_build/
@@ -224,18 +232,18 @@ jobs:
         run: |
           set -ex
           DIST_DIR="nuitka_build/轻松评.dist"
-          
+
           find "$DIST_DIR" -name "*.so" -exec strip --strip-all {} + 2>/dev/null || true
-          
+
           if [ -f "$DIST_DIR/_entry_protected" ]; then
             patchelf --set-rpath '$ORIGIN' "$DIST_DIR/_entry_protected" 2>/dev/null || true
             mv "$DIST_DIR/_entry_protected" "$DIST_DIR/轻松评"
           fi
-          
+
           if command -v upx &> /dev/null && [ -f "$DIST_DIR/轻松评" ]; then
             upx --best --lzma "$DIST_DIR/轻松评" 2>/dev/null || echo "UPX 压缩跳过"
           fi
-          
+
           PYTHON_SO=$(find "$DIST_DIR" -name "libpython3*.so*" | head -n 1)
           if [ -n "$PYTHON_SO" ]; then
             BASENAME=$(basename "$PYTHON_SO")
@@ -243,7 +251,7 @@ jobs:
             mv "$PYTHON_SO" "$DIRNAME/.${BASENAME}.bin"
             ln -s ".${BASENAME}.bin" "$PYTHON_SO"
           fi
-          
+
           echo "二进制加固完成"
 
       # ========== 步骤7：完善分发包 ==========
@@ -252,10 +260,10 @@ jobs:
           set -ex
           SRC_DIR="nuitka_build/轻松评.dist"
           OUTPUT_DIR="dist/轻松评"
-          
+
           mkdir -p "$OUTPUT_DIR"
           cp -r "$SRC_DIR"/* "$OUTPUT_DIR/"
-          
+
           mkdir -p "$OUTPUT_DIR/lib"
           for lib in libgomp libquadmath libgfortran libopenblas; do
             find /usr/lib -name "${lib}.so.*" -exec cp {} "$OUTPUT_DIR/lib/" \; 2>/dev/null || true
@@ -266,7 +274,7 @@ jobs:
           for lib in libffi libstdc++ liblzma libbz2 libsqlite3; do
             find /usr/lib -name "${lib}.so.*" -exec cp {} "$OUTPUT_DIR/lib/" \; 2>/dev/null || true
           done
-          
+
           cat > "$OUTPUT_DIR/run.sh" << "RUN_SCRIPT"
           #!/bin/bash
           DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -276,7 +284,7 @@ jobs:
           exec "$DIR/轻松评" "$@"
           RUN_SCRIPT
           chmod +x "$OUTPUT_DIR/run.sh" "$OUTPUT_DIR/轻松评"
-          
+
           cat > "$OUTPUT_DIR/安装桌面快捷方式.sh" << "INSTALL_SCRIPT"
           #!/bin/bash
           SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -303,8 +311,8 @@ jobs:
           chmod +x "$DESKTOP_DIR/轻松评.desktop"
           echo "桌面快捷方式已创建"
           INSTALL_SCRIPT
-          chmod -x "$OUTPUT_DIR/安装桌面快捷方式.sh"
-          
+          chmod +x "$OUTPUT_DIR/安装桌面快捷方式.sh"
+
           ls -la "$OUTPUT_DIR/"
 
       # ========== 步骤8：打包产物 ==========
