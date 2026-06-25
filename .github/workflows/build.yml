@@ -22,17 +22,12 @@ jobs:
       - name: 安装系统依赖
         run: |
           set -ex
-          # 使用官方源，清除可能存在的第三方源配置
           rm -f /etc/apt/sources.list.d/*.list 2>/dev/null || true
-
-          # 多次更新重试
           for i in 1 2 3; do
             apt-get update -qq && break
             echo "apt update 失败，重试 $i/3..."
             sleep 5
           done
-
-          # 安装依赖（带 --fix-missing 和重试）
           for i in 1 2 3; do
             apt-get install -y -qq --no-install-recommends --fix-missing \
               tzdata \
@@ -48,8 +43,6 @@ jobs:
             echo "apt install 失败，重试 $i/3..."
             sleep 10
           done
-
-          # 配置时区
           ln -fs /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
           dpkg-reconfigure -f noninteractive tzdata 2>/dev/null || true
           clang --version
@@ -63,15 +56,21 @@ jobs:
           pip3 install nuitka pandas openpyxl numpy ordered-set zstandard
           python3 -m nuitka --version
 
-      # ========== 步骤3：编译反调试 C 扩展 ==========
+      # ========== 步骤3：编译反调试 C 扩展（修复所有高风险+中风险）==========
       - name: 编译反调试 C 扩展
         run: |
           set -ex
           PY_FILE=$(ls *.py | head -n 1)
           echo "检测到主文件：$PY_FILE"
-
+          
           mkdir -p anti_reverse
-
+          
+          # 修复：
+          # 1. ptrace 容错处理（避免误杀正常启动）
+          # 2. 使用 abort() 替代 _exit(1)（增加绕过难度）
+          # 3. 分散检测点到多个时机
+          # 4. 使用 getrandom 替代 rand()
+          # 5. 增加延迟范围到 50-200ms
           cat > anti_reverse/_anti_debug.c << 'ANTIDEBUG_C'
           #define PY_SSIZE_T_CLEAN
           #include <Python.h>
@@ -80,8 +79,11 @@ jobs:
           #include <string.h>
           #include <unistd.h>
           #include <sys/ptrace.h>
+          #include <sys/random.h>
           #include <time.h>
-
+          #include <signal.h>
+          
+          /* 检测 TracerPid */
           static int check_tracer(void) {
               char path[64], buf[256];
               snprintf(path, sizeof(path), "/proc/%d/status", getpid());
@@ -98,39 +100,68 @@ jobs:
               fclose(fp);
               return traced;
           }
-
+          
+          /* 修复1：ptrace 容错处理
+           * 如果 ptrace 失败但 TracerPid 为 0，说明是环境限制而非调试器 */
           static int self_ptrace(void) {
               if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) == -1) {
-                  return 1;
+                  if (!check_tracer()) {
+                      return 0; /* 环境限制，允许继续 */
+                  }
+                  return 1; /* 确实被调试 */
               }
               return 0;
           }
-
+          
+          /* 修复5：使用 getrandom 替代 rand()，增加延迟范围 */
           static void anti_timing(void) {
-              struct timespec ts;
-              ts.tv_sec = 0;
-              ts.tv_nsec = (rand() % 5000000) + 1000000;
-              nanosleep(&ts, NULL);
+              unsigned char buf[4];
+              if (getrandom(buf, sizeof(buf), 0) == sizeof(buf)) {
+                  unsigned int rand_val = *(unsigned int*)buf;
+                  struct timespec ts;
+                  ts.tv_sec = 0;
+                  ts.tv_nsec = (rand_val % 150000000) + 50000000; /* 50-200ms */
+                  nanosleep(&ts, NULL);
+              }
           }
-
-          static PyObject* anti_debug_init(PyObject *self, PyObject *args) {
-              srand((unsigned)time(NULL) ^ getpid());
+          
+          /* 修复2：静默失败，使用 abort() 替代 _exit(1)
+           * abort() 产生 SIGABRT 和 core dump，增加分析难度 */
+          static void silent_fail(void) {
+              anti_timing();
+              anti_timing();
+              raise(SIGABRT); /* 使用 raise 替代 abort，增加 hook 难度 */
+          }
+          
+          /* 检测点1：模块加载时 */
+          static void checkpoint_1(void) {
               anti_timing();
               if (check_tracer()) {
-                  _exit(1);
+                  silent_fail();
               }
+          }
+          
+          /* 检测点2：初始化时 */
+          static void checkpoint_2(void) {
+              anti_timing();
               if (self_ptrace()) {
-                  _exit(1);
+                  silent_fail();
               }
+          }
+          
+          /* 检测点3：Python 接口调用时 */
+          static PyObject* anti_debug_init(PyObject *self, PyObject *args) {
+              checkpoint_1();
+              checkpoint_2();
               anti_timing();
               Py_RETURN_NONE;
           }
-
+          
           static PyMethodDef AntiDebugMethods[] = {
               {"init", anti_debug_init, METH_NOARGS, "Initialize anti-debug protection"},
               {NULL, NULL, 0, NULL}
           };
-
+          
           static struct PyModuleDef anti_debug_module = {
               PyModuleDef_HEAD_INIT,
               "_anti_debug",
@@ -138,63 +169,76 @@ jobs:
               -1,
               AntiDebugMethods
           };
-
+          
           PyMODINIT_FUNC PyInit__anti_debug(void) {
               PyObject *m = PyModule_Create(&anti_debug_module);
               if (m == NULL) return NULL;
-              anti_debug_init(NULL, NULL);
+              /* 修复4：分散检测点到模块初始化 */
+              checkpoint_1();
+              checkpoint_2();
               return m;
           }
           ANTIDEBUG_C
-
+          
+          # 修复4：添加安全编译选项
           cat > anti_reverse/setup.py << 'SETUP_PY'
           from setuptools import setup, Extension
           module = Extension(
               '_anti_debug',
               sources=['_anti_debug.c'],
-              extra_compile_args=['-O3', '-fPIC', '-D_FORTIFY_SOURCE=2'],
+              extra_compile_args=[
+                  '-O3', '-fPIC',
+                  '-fstack-protector-strong',  # 栈保护
+                  '-D_FORTIFY_SOURCE=2',
+                  '-fPIE',  # 位置无关代码
+              ],
+              extra_link_args=[
+                  '-pie',  # 位置无关可执行文件
+                  '-Wl,-z,relro,-z,now',  # 重定位只读 + 立即绑定
+                  '-s',  # 剥离符号
+              ],
           )
           setup(name='anti_debug', version='1.0', ext_modules=[module])
           SETUP_PY
-
+          
           cd anti_reverse
-          CC=clang LDSHARED="clang -shared" python3 setup.py build_ext --inplace
+          CC=clang LDSHARED="clang -shared" python3 setup.py build_ext --inplace > /dev/null 2>&1
           cd ..
-
+          
           cp anti_reverse/_anti_debug*.so ./_anti_debug.so
           ls -la _anti_debug.so
 
-      # ========== 步骤4：创建受保护的入口包装器 ==========
+      # ========== 步骤4：创建受保护的入口包装器（修复父进程名误报）==========
       - name: 创建入口包装器
         run: |
           set -ex
           PY_FILE=$(ls *.py | grep -v "^_" | head -n 1)
           echo "主文件：$PY_FILE"
-
+          
           cat > _entry_protected.py << 'ENTRY'
           import _anti_debug
           import sys
           import os
-
+          
+          # 修复3：使用完整集合匹配而非子串匹配
           def _verify_env():
-              suspicious = ['gdb', 'ltrace', 'strace', 'radare2', 'ghidra', 'ida']
+              suspicious = {'gdb', 'ltrace', 'strace', 'radare2', 'ghidra', 'ida', 'ida64'}
               try:
                   parent_cmd = open(f'/proc/{os.getppid()}/comm', 'r').read().strip()
-                  if any(s in parent_cmd.lower() for s in suspicious):
+                  if parent_cmd.lower() in suspicious:
                       os._exit(1)
               except:
                   pass
-
+          
           _verify_env()
-
-          import importlib.util
+          
+          # 修复8：使用 exec 保持 __name__ == '__main__' 上下文
           main_path = os.path.join(os.path.dirname(__file__), "__main__.py")
-          spec = importlib.util.spec_from_file_location("main", main_path)
-          main_module = importlib.util.module_from_spec(spec)
-          sys.modules["main"] = main_module
-          spec.loader.exec_module(main_module)
+          with open(main_path, 'r') as f:
+              code = compile(f.read(), main_path, 'exec')
+              exec(code, {'__name__': '__main__', '__file__': main_path})
           ENTRY
-
+          
           cp "$PY_FILE" __main__.py
           echo "入口包装器创建完成"
 
@@ -202,7 +246,7 @@ jobs:
       - name: Nuitka 编译
         run: |
           set -ex
-
+          
           python3 -m nuitka \
             --mode=standalone \
             --enable-plugin=tk-inter \
@@ -219,24 +263,23 @@ jobs:
             --jobs=1 \
             --output-dir=nuitka_build \
             _entry_protected.py
-
+          
           echo "Nuitka 编译完成"
-
-          # 重命名输出目录和文件
+          
           mv nuitka_build/_entry_protected.dist nuitka_build/轻松评.dist 2>/dev/null || true
           mv nuitka_build/_entry_protected.bin nuitka_build/轻松评 2>/dev/null || true
           ls -la nuitka_build/
 
-      # ========== 步骤6：二进制加固 ==========
+      # ========== 步骤6：二进制加固（修复 UPX 和 RPATH）==========
       - name: 二进制加固
         run: |
           set -ex
           DIST_DIR="nuitka_build/轻松评.dist"
-
+          
           # 1. strip 所有 .so 文件
           find "$DIST_DIR" -name "*.so" -exec strip --strip-all {} + 2>/dev/null || true
-
-          # 2. 找到主二进制并处理（Nuitka 生成的文件名可能是 _entry_protected 或 轻松评）
+          
+          # 2. 找到主二进制并处理
           if [ -f "$DIST_DIR/_entry_protected" ]; then
             MAIN_BIN="$DIST_DIR/_entry_protected"
           elif [ -f "$DIST_DIR/_entry_protected.bin" ]; then
@@ -248,20 +291,24 @@ jobs:
             ls -la "$DIST_DIR/"
             exit 1
           fi
-
-          # 统一重命名为 轻松评
+          
           if [ "$MAIN_BIN" != "$DIST_DIR/轻松评" ]; then
             mv "$MAIN_BIN" "$DIST_DIR/轻松评"
           fi
-
-          # patchelf 修改 RPATH
+          
+          # 修复6：patchelf 修改 RPATH
           patchelf --set-rpath '$ORIGIN' "$DIST_DIR/轻松评" 2>/dev/null || true
-
-          # UPX 压缩
+          
+          # 修复8：UPX 仅在文件小于 500MB 时压缩（避免兼容性问题）
           if command -v upx &> /dev/null; then
-            upx --best --lzma "$DIST_DIR/轻松评" 2>/dev/null || echo "UPX 压缩跳过"
+            FILE_SIZE=$(stat -c%s "$DIST_DIR/轻松评" 2>/dev/null || echo 0)
+            if [ "$FILE_SIZE" -gt 0 ] && [ "$FILE_SIZE" -lt 524288000 ]; then
+              upx --best --lzma "$DIST_DIR/轻松评" 2>/dev/null || echo "UPX 压缩跳过"
+            else
+              echo "文件过大或无法获取大小，跳过 UPX 压缩"
+            fi
           fi
-
+          
           # 混淆关键库文件名
           PYTHON_SO=$(find "$DIST_DIR" -name "libpython3*.so*" | head -n 1)
           if [ -n "$PYTHON_SO" ]; then
@@ -270,21 +317,21 @@ jobs:
             mv "$PYTHON_SO" "$DIRNAME/.${BASENAME}.bin"
             ln -s ".${BASENAME}.bin" "$PYTHON_SO"
           fi
-
+          
           echo "二进制加固完成"
           ls -la "$DIST_DIR/"
 
-      # ========== 步骤7：完善分发包 ==========
+      # ========== 步骤7：完善分发包（修复 GLIBC 冲突和权限）==========
       - name: 完善分发包
         run: |
           set -ex
           SRC_DIR="nuitka_build/轻松评.dist"
           OUTPUT_DIR="dist/轻松评"
-
+          
           mkdir -p "$OUTPUT_DIR"
           cp -r "$SRC_DIR"/* "$OUTPUT_DIR/"
-
-          # 复制可能缺失的系统库
+          
+          # 修复6：仅复制非 GLIBC 核心库（避免版本冲突）
           mkdir -p "$OUTPUT_DIR/lib"
           for lib in libgomp libquadmath libgfortran libopenblas; do
             find /usr/lib -name "${lib}.so.*" -exec cp {} "$OUTPUT_DIR/lib/" \; 2>/dev/null || true
@@ -292,28 +339,32 @@ jobs:
           for lib in libtcl libtk libXft libXrender libfontconfig; do
             find /usr/lib -name "${lib}.so.*" -exec cp {} "$OUTPUT_DIR/lib/" \; 2>/dev/null || true
           done
-          for lib in libffi libstdc++ liblzma libbz2 libsqlite3; do
+          for lib in libffi liblzma libbz2 libsqlite3; do
             find /usr/lib -name "${lib}.so.*" -exec cp {} "$OUTPUT_DIR/lib/" \; 2>/dev/null || true
           done
-
+          # 不复制：libstdc++、libc、libm、libdl、libpthread（由系统提供）
+          
           # 验证主二进制存在
           if [ ! -f "$OUTPUT_DIR/轻松评" ]; then
             echo "错误：dist/轻松评/轻松评 不存在"
             ls -la "$OUTPUT_DIR/"
             exit 1
           fi
-
-          # 生成启动脚本
+          
+          # 修复6：生成带权限检查的启动脚本
           cat > "$OUTPUT_DIR/run.sh" << "RUN_SCRIPT"
           #!/bin/bash
           DIR="$(cd "$(dirname "$0")" && pwd)"
+          # 确保目录权限安全
+          chmod 755 "$DIR" 2>/dev/null || true
+          chmod 755 "$DIR/lib" 2>/dev/null || true
           export LD_LIBRARY_PATH="$DIR/lib:$DIR:$LD_LIBRARY_PATH"
           export PYTHONPATH="$DIR:$PYTHONPATH"
           export _ANTI_DEBUG=1
           exec "$DIR/轻松评" "$@"
           RUN_SCRIPT
           chmod +x "$OUTPUT_DIR/run.sh" "$OUTPUT_DIR/轻松评"
-
+          
           # 生成桌面快捷方式安装脚本
           cat > "$OUTPUT_DIR/安装桌面快捷方式.sh" << "INSTALL_SCRIPT"
           #!/bin/bash
@@ -342,7 +393,7 @@ jobs:
           echo "桌面快捷方式已创建"
           INSTALL_SCRIPT
           chmod +x "$OUTPUT_DIR/安装桌面快捷方式.sh"
-
+          
           echo "分发包完善完成"
           ls -la "$OUTPUT_DIR/"
 
