@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ========== 步骤1：安装系统依赖（含 Clang，不含 GCC）==========
+      # ========== 步骤1：安装系统依赖 ==========
       - name: 安装系统依赖
         run: |
           set -ex
@@ -50,7 +50,7 @@ jobs:
           pip3 install nuitka pandas openpyxl numpy ordered-set zstandard
           python3 -m nuitka --version
 
-      # ========== 步骤3：编译反调试 C 扩展（修正：CC + LDSHARED 都用 Clang）==========
+      # ========== 步骤3：编译反调试 C 扩展 ==========
       - name: 编译反调试 C 扩展
         run: |
           set -ex
@@ -145,10 +145,10 @@ jobs:
           SETUP_PY
           
           cd anti_reverse
-          # 关键修正：同时设置 CC 和 LDSHARED，确保编译和链接都用 clang
           CC=clang LDSHARED="clang -shared" python3 setup.py build_ext --inplace
           cd ..
           
+          # 将编译好的 .so 复制到工作目录根，确保 Nuitka 能自动发现
           cp anti_reverse/_anti_debug*.so ./_anti_debug.so
           ls -la _anti_debug.so
 
@@ -186,10 +186,15 @@ jobs:
           cp "$PY_FILE" __main__.py
           echo "入口包装器创建完成"
 
-      # ========== 步骤5：Nuitka 编译（关闭 LTO，使用 Clang，低内存模式）==========
+      # ========== 步骤5：Nuitka 编译（删除冲突的 --include-data-files）==========
       - name: Nuitka 编译
         run: |
           set -ex
+          
+          # 关键修正：
+          # 1. 删除 --include-data-files=_anti_debug.so（Nuitka 自动打包 C 扩展，与 data-files 冲突）
+          # 2. 保留 --include-module=_anti_debug 让 Nuitka 显式包含该模块
+          # 3. __main__.py 仍需作为数据文件嵌入
           
           python3 -m nuitka \
             --mode=standalone \
@@ -197,10 +202,10 @@ jobs:
             --clang \
             --lto=no \
             --low-memory \
+            --include-module=_anti_debug \
             --include-package=pandas \
             --include-package=openpyxl \
             --include-package=numpy \
-            --include-data-files=_anti_debug.so=_anti_debug.so \
             --include-data-files=__main__.py=__main__.py \
             --remove-output \
             --no-pyi-file \
@@ -298,7 +303,7 @@ jobs:
           chmod +x "$DESKTOP_DIR/轻松评.desktop"
           echo "桌面快捷方式已创建"
           INSTALL_SCRIPT
-          chmod +x "$OUTPUT_DIR/安装桌面快捷方式.sh"
+          chmod -x "$OUTPUT_DIR/安装桌面快捷方式.sh"
           
           ls -la "$OUTPUT_DIR/"
 
