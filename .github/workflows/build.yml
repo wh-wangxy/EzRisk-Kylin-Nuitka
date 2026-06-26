@@ -185,16 +185,16 @@ jobs:
           cp anti_reverse/_anti_debug*.so ./_anti_debug.so
           ls -la _anti_debug.so
 
-      # ========== 步骤4：将反调试代码注入原文件头部（关键修复：消除源码泄漏）==========
+      # ========== 步骤4：将反调试代码注入原文件头部 ==========
       - name: 注入反调试代码并生成编译文件
         run: |
           set -ex
           PY_FILE=$(ls *.py | grep -v "^_" | head -n 1)
           echo "主文件：$PY_FILE"
           
-          # 创建反调试注入头（模块级别，导入时立即执行）
-          cat > _injected_header.py << 'HEADER'
-          # [INJECTED] 反逆向保护模块 - 此代码由构建系统自动注入
+          # 使用 .tmp 后缀避免被后续 ls _*.py 匹配
+          cat > injected_header.tmp << 'HEADER'
+          # [INJECTED] 反逆向保护模块
           import os as _anti_os
           import sys as _anti_sys
           try:
@@ -215,22 +215,23 @@ jobs:
           # [END INJECTED]
           HEADER
           
-          # 将注入头 + 原文件内容合并为新文件
-          # 使用 _ 前缀避免被 ls 误识别为入口文件
-          cat _injected_header.py "$PY_FILE" > "_${PY_FILE}"
+          # 合并为新文件，明确记录文件名
+          COMPILE_FILE="_${PY_FILE}"
+          cat injected_header.tmp "$PY_FILE" > "$COMPILE_FILE"
+          rm -f injected_header.tmp
           
-          # 验证注入成功
-          head -n 20 "_${PY_FILE}"
-          echo "反调试代码注入完成，生成编译文件：_${PY_FILE}"
+          # 验证
+          head -n 20 "$COMPILE_FILE"
+          echo "反调试代码注入完成，编译文件：$COMPILE_FILE"
 
-      # ========== 步骤5：Nuitka 直接编译注入后的文件（无 __main__.py 数据文件）==========
+      # ========== 步骤5：Nuitka 直接编译注入后的文件 ==========
       - name: Nuitka 编译
         run: |
           set -ex
           
-          # 关键：直接编译注入后的原文件，不保留任何 .py 源码
-          # 删除 --include-data-files=__main__.py（不再泄漏源码）
-          PY_FILE=$(ls _*.py | head -n 1)
+          # 使用步骤4中明确生成的文件名
+          COMPILE_FILE=$(ls _*.py | head -n 1)
+          echo "编译文件：$COMPILE_FILE"
           
           python3 -m nuitka \
             --mode=standalone \
@@ -247,43 +248,57 @@ jobs:
             --jobs=1 \
             --output-dir=nuitka_build \
             --output-filename=轻松评 \
-            "$PY_FILE"
+            "$COMPILE_FILE"
           
           echo "Nuitka 编译完成"
           ls -la nuitka_build/
 
-      # ========== 步骤6：二进制加固 ==========
+      # ========== 步骤6：二进制加固（动态查找目录和二进制）==========
       - name: 二进制加固
         run: |
           set -ex
-          DIST_DIR="nuitka_build/轻松评.dist"
           
-          # 确保目录存在
-          if [ ! -d "$DIST_DIR" ]; then
-            echo "错误：找不到编译输出目录 $DIST_DIR"
+          # 动态查找 Nuitka 生成的 .dist 目录（可能是 _轻松评20260623.dist 等）
+          DIST_DIR=$(find nuitka_build -maxdepth 1 -name "*.dist" -type d | head -n 1)
+          if [ -z "$DIST_DIR" ]; then
+            echo "错误：找不到编译输出 .dist 目录"
             ls -la nuitka_build/
             exit 1
+          fi
+          echo "找到编译输出目录：$DIST_DIR"
+          
+          # 统一重命名为标准目录名
+          if [ "$DIST_DIR" != "nuitka_build/轻松评.dist" ]; then
+            mv "$DIST_DIR" nuitka_build/轻松评.dist
+            DIST_DIR="nuitka_build/轻松评.dist"
           fi
           
           # 1. strip 所有 .so 文件
           find "$DIST_DIR" -name "*.so" -exec strip --strip-all {} + 2>/dev/null || true
           
-          # 2. 找到主二进制（Nuitka 输出文件名由 --output-filename 决定）
+          # 2. 动态查找主二进制（Nuitka 命名可能不同）
           if [ -f "$DIST_DIR/轻松评" ]; then
-            MAIN_BIN="$DIST_DIR/轻松评"
+            echo "找到主二进制：轻松评"
           elif [ -f "$DIST_DIR/轻松评.bin" ]; then
-            MAIN_BIN="$DIST_DIR/轻松评.bin"
-            mv "$MAIN_BIN" "$DIST_DIR/轻松评"
+            mv "$DIST_DIR/轻松评.bin" "$DIST_DIR/轻松评"
+            echo "重命名 .bin 为 轻松评"
           else
-            echo "错误：找不到主二进制文件"
-            ls -la "$DIST_DIR/"
-            exit 1
+            # 查找可执行文件（排除 .so）
+            ENTRY_BIN=$(find "$DIST_DIR" -maxdepth 1 -type f -executable ! -name "*.so" | head -n 1)
+            if [ -n "$ENTRY_BIN" ]; then
+              mv "$ENTRY_BIN" "$DIST_DIR/轻松评"
+              echo "找到并重命名主二进制：$(basename "$ENTRY_BIN") -> 轻松评"
+            else
+              echo "错误：找不到主二进制文件"
+              ls -la "$DIST_DIR/"
+              exit 1
+            fi
           fi
           
           # patchelf 修改 RPATH
           patchelf --set-rpath '$ORIGIN' "$DIST_DIR/轻松评" 2>/dev/null || true
           
-          # UPX 压缩：仅当文件 < 500MB 时执行
+          # UPX 压缩：仅当文件 < 500MB
           if command -v upx &> /dev/null; then
             FILE_SIZE=$(stat -c%s "$DIST_DIR/轻松评" 2>/dev/null || echo 0)
             if [ "$FILE_SIZE" -gt 0 ] && [ "$FILE_SIZE" -lt 524288000 ]; then
