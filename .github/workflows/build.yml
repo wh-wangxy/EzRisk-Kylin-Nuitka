@@ -1,4 +1,4 @@
-name: 麒麟版打包（Nuitka 原生编译 + 反逆向保护 + Ubuntu 20.04 容器）
+name: 麒麟版打包（Nuitka 原生编译 + 反逆向保护 + 无源码泄漏）
 
 on:
   push:
@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ========== 步骤1：安装系统依赖（官方源 + 重试机制）==========
+      # ========== 步骤1：安装系统依赖 ==========
       - name: 安装系统依赖
         run: |
           set -ex
@@ -56,7 +56,7 @@ jobs:
           pip3 install nuitka pandas openpyxl numpy ordered-set zstandard
           python3 -m nuitka --version
 
-      # ========== 步骤3：编译反调试 C 扩展（修复所有高风险+中风险）==========
+      # ========== 步骤3：编译反调试 C 扩展 ==========
       - name: 编译反调试 C 扩展
         run: |
           set -ex
@@ -65,12 +65,6 @@ jobs:
           
           mkdir -p anti_reverse
           
-          # 修复：
-          # 1. ptrace 容错处理（避免误杀正常启动）
-          # 2. 使用 abort() 替代 _exit(1)（增加绕过难度）
-          # 3. 分散检测点到多个时机
-          # 4. 使用 getrandom 替代 rand()
-          # 5. 增加延迟范围到 50-200ms
           cat > anti_reverse/_anti_debug.c << 'ANTIDEBUG_C'
           #define PY_SSIZE_T_CLEAN
           #include <Python.h>
@@ -83,7 +77,6 @@ jobs:
           #include <time.h>
           #include <signal.h>
           
-          /* 检测 TracerPid */
           static int check_tracer(void) {
               char path[64], buf[256];
               snprintf(path, sizeof(path), "/proc/%d/status", getpid());
@@ -101,55 +94,41 @@ jobs:
               return traced;
           }
           
-          /* 修复1：ptrace 容错处理
-           * 如果 ptrace 失败但 TracerPid 为 0，说明是环境限制而非调试器 */
           static int self_ptrace(void) {
               if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) == -1) {
-                  if (!check_tracer()) {
-                      return 0; /* 环境限制，允许继续 */
-                  }
-                  return 1; /* 确实被调试 */
+                  if (!check_tracer()) return 0;
+                  return 1;
               }
               return 0;
           }
           
-          /* 修复5：使用 getrandom 替代 rand()，增加延迟范围 */
           static void anti_timing(void) {
               unsigned char buf[4];
               if (getrandom(buf, sizeof(buf), 0) == sizeof(buf)) {
                   unsigned int rand_val = *(unsigned int*)buf;
                   struct timespec ts;
                   ts.tv_sec = 0;
-                  ts.tv_nsec = (rand_val % 150000000) + 50000000; /* 50-200ms */
+                  ts.tv_nsec = (rand_val % 150000000) + 50000000;
                   nanosleep(&ts, NULL);
               }
           }
           
-          /* 修复2：静默失败，使用 abort() 替代 _exit(1)
-           * abort() 产生 SIGABRT 和 core dump，增加分析难度 */
           static void silent_fail(void) {
               anti_timing();
               anti_timing();
-              raise(SIGABRT); /* 使用 raise 替代 abort，增加 hook 难度 */
+              raise(SIGABRT);
           }
           
-          /* 检测点1：模块加载时 */
           static void checkpoint_1(void) {
               anti_timing();
-              if (check_tracer()) {
-                  silent_fail();
-              }
+              if (check_tracer()) silent_fail();
           }
           
-          /* 检测点2：初始化时 */
           static void checkpoint_2(void) {
               anti_timing();
-              if (self_ptrace()) {
-                  silent_fail();
-              }
+              if (self_ptrace()) silent_fail();
           }
           
-          /* 检测点3：Python 接口调用时 */
           static PyObject* anti_debug_init(PyObject *self, PyObject *args) {
               checkpoint_1();
               checkpoint_2();
@@ -173,14 +152,12 @@ jobs:
           PyMODINIT_FUNC PyInit__anti_debug(void) {
               PyObject *m = PyModule_Create(&anti_debug_module);
               if (m == NULL) return NULL;
-              /* 修复4：分散检测点到模块初始化 */
               checkpoint_1();
               checkpoint_2();
               return m;
           }
           ANTIDEBUG_C
           
-          # 修复4：添加安全编译选项
           cat > anti_reverse/setup.py << 'SETUP_PY'
           from setuptools import setup, Extension
           module = Extension(
@@ -188,14 +165,14 @@ jobs:
               sources=['_anti_debug.c'],
               extra_compile_args=[
                   '-O3', '-fPIC',
-                  '-fstack-protector-strong',  # 栈保护
+                  '-fstack-protector-strong',
                   '-D_FORTIFY_SOURCE=2',
-                  '-fPIE',  # 位置无关代码
+                  '-fPIE',
               ],
               extra_link_args=[
-                  '-pie',  # 位置无关可执行文件
-                  '-Wl,-z,relro,-z,now',  # 重定位只读 + 立即绑定
-                  '-s',  # 剥离符号
+                  '-pie',
+                  '-Wl,-z,relro,-z,now',
+                  '-s',
               ],
           )
           setup(name='anti_debug', version='1.0', ext_modules=[module])
@@ -208,44 +185,52 @@ jobs:
           cp anti_reverse/_anti_debug*.so ./_anti_debug.so
           ls -la _anti_debug.so
 
-      # ========== 步骤4：创建受保护的入口包装器（修复父进程名误报）==========
-      - name: 创建入口包装器
+      # ========== 步骤4：将反调试代码注入原文件头部（关键修复：消除源码泄漏）==========
+      - name: 注入反调试代码并生成编译文件
         run: |
           set -ex
           PY_FILE=$(ls *.py | grep -v "^_" | head -n 1)
           echo "主文件：$PY_FILE"
           
-          cat > _entry_protected.py << 'ENTRY'
-          import _anti_debug
-          import sys
-          import os
+          # 创建反调试注入头（模块级别，导入时立即执行）
+          cat > _injected_header.py << 'HEADER'
+          # [INJECTED] 反逆向保护模块 - 此代码由构建系统自动注入
+          import os as _anti_os
+          import sys as _anti_sys
+          try:
+              import _anti_debug as _anti_mod
+          except ImportError:
+              _anti_mod = None
           
-          # 修复3：使用完整集合匹配而非子串匹配
-          def _verify_env():
-              suspicious = {'gdb', 'ltrace', 'strace', 'radare2', 'ghidra', 'ida', 'ida64'}
+          def _anti_verify_env():
+              _suspicious = {'gdb', 'ltrace', 'strace', 'radare2', 'ghidra', 'ida', 'ida64'}
               try:
-                  parent_cmd = open(f'/proc/{os.getppid()}/comm', 'r').read().strip()
-                  if parent_cmd.lower() in suspicious:
-                      os._exit(1)
+                  _parent_cmd = open(f'/proc/{_anti_os.getppid()}/comm', 'r').read().strip()
+                  if _parent_cmd.lower() in _suspicious:
+                      _anti_os._exit(1)
               except:
                   pass
           
-          _verify_env()
+          _anti_verify_env()
+          # [END INJECTED]
+          HEADER
           
-          # 修复8：使用 exec 保持 __name__ == '__main__' 上下文
-          main_path = os.path.join(os.path.dirname(__file__), "__main__.py")
-          with open(main_path, 'r') as f:
-              code = compile(f.read(), main_path, 'exec')
-              exec(code, {'__name__': '__main__', '__file__': main_path})
-          ENTRY
+          # 将注入头 + 原文件内容合并为新文件
+          # 使用 _ 前缀避免被 ls 误识别为入口文件
+          cat _injected_header.py "$PY_FILE" > "_${PY_FILE}"
           
-          cp "$PY_FILE" __main__.py
-          echo "入口包装器创建完成"
+          # 验证注入成功
+          head -n 20 "_${PY_FILE}"
+          echo "反调试代码注入完成，生成编译文件：_${PY_FILE}"
 
-      # ========== 步骤5：Nuitka 编译 ==========
+      # ========== 步骤5：Nuitka 直接编译注入后的文件（无 __main__.py 数据文件）==========
       - name: Nuitka 编译
         run: |
           set -ex
+          
+          # 关键：直接编译注入后的原文件，不保留任何 .py 源码
+          # 删除 --include-data-files=__main__.py（不再泄漏源码）
+          PY_FILE=$(ls _*.py | head -n 1)
           
           python3 -m nuitka \
             --mode=standalone \
@@ -257,55 +242,55 @@ jobs:
             --include-package=pandas \
             --include-package=openpyxl \
             --include-package=numpy \
-            --include-data-files=__main__.py=__main__.py \
             --remove-output \
             --no-pyi-file \
             --jobs=1 \
             --output-dir=nuitka_build \
-            _entry_protected.py
+            --output-filename=轻松评 \
+            "$PY_FILE"
           
           echo "Nuitka 编译完成"
-          
-          mv nuitka_build/_entry_protected.dist nuitka_build/轻松评.dist 2>/dev/null || true
-          mv nuitka_build/_entry_protected.bin nuitka_build/轻松评 2>/dev/null || true
           ls -la nuitka_build/
 
-      # ========== 步骤6：二进制加固（修复 UPX 和 RPATH）==========
+      # ========== 步骤6：二进制加固 ==========
       - name: 二进制加固
         run: |
           set -ex
           DIST_DIR="nuitka_build/轻松评.dist"
           
+          # 确保目录存在
+          if [ ! -d "$DIST_DIR" ]; then
+            echo "错误：找不到编译输出目录 $DIST_DIR"
+            ls -la nuitka_build/
+            exit 1
+          fi
+          
           # 1. strip 所有 .so 文件
           find "$DIST_DIR" -name "*.so" -exec strip --strip-all {} + 2>/dev/null || true
           
-          # 2. 找到主二进制并处理
-          if [ -f "$DIST_DIR/_entry_protected" ]; then
-            MAIN_BIN="$DIST_DIR/_entry_protected"
-          elif [ -f "$DIST_DIR/_entry_protected.bin" ]; then
-            MAIN_BIN="$DIST_DIR/_entry_protected.bin"
-          elif [ -f "$DIST_DIR/轻松评" ]; then
+          # 2. 找到主二进制（Nuitka 输出文件名由 --output-filename 决定）
+          if [ -f "$DIST_DIR/轻松评" ]; then
             MAIN_BIN="$DIST_DIR/轻松评"
+          elif [ -f "$DIST_DIR/轻松评.bin" ]; then
+            MAIN_BIN="$DIST_DIR/轻松评.bin"
+            mv "$MAIN_BIN" "$DIST_DIR/轻松评"
           else
             echo "错误：找不到主二进制文件"
             ls -la "$DIST_DIR/"
             exit 1
           fi
           
-          if [ "$MAIN_BIN" != "$DIST_DIR/轻松评" ]; then
-            mv "$MAIN_BIN" "$DIST_DIR/轻松评"
-          fi
-          
-          # 修复6：patchelf 修改 RPATH
+          # patchelf 修改 RPATH
           patchelf --set-rpath '$ORIGIN' "$DIST_DIR/轻松评" 2>/dev/null || true
           
-          # 修复8：UPX 仅在文件小于 500MB 时压缩（避免兼容性问题）
+          # UPX 压缩：仅当文件 < 500MB 时执行
           if command -v upx &> /dev/null; then
             FILE_SIZE=$(stat -c%s "$DIST_DIR/轻松评" 2>/dev/null || echo 0)
             if [ "$FILE_SIZE" -gt 0 ] && [ "$FILE_SIZE" -lt 524288000 ]; then
-              upx --best --lzma "$DIST_DIR/轻松评" 2>/dev/null || echo "UPX 压缩跳过"
+              echo "文件大小 $((FILE_SIZE/1024/1024))MB，执行 UPX 压缩..."
+              upx --best --lzma "$DIST_DIR/轻松评" 2>/dev/null || echo "UPX 压缩失败，跳过"
             else
-              echo "文件过大或无法获取大小，跳过 UPX 压缩"
+              echo "文件过大($((FILE_SIZE/1024/1024))MB)或无法获取大小，跳过 UPX 压缩"
             fi
           fi
           
@@ -321,7 +306,7 @@ jobs:
           echo "二进制加固完成"
           ls -la "$DIST_DIR/"
 
-      # ========== 步骤7：完善分发包（修复 GLIBC 冲突和权限）==========
+      # ========== 步骤7：完善分发包 ==========
       - name: 完善分发包
         run: |
           set -ex
@@ -331,7 +316,7 @@ jobs:
           mkdir -p "$OUTPUT_DIR"
           cp -r "$SRC_DIR"/* "$OUTPUT_DIR/"
           
-          # 修复6：仅复制非 GLIBC 核心库（避免版本冲突）
+          # 仅复制非 GLIBC 核心库
           mkdir -p "$OUTPUT_DIR/lib"
           for lib in libgomp libquadmath libgfortran libopenblas; do
             find /usr/lib -name "${lib}.so.*" -exec cp {} "$OUTPUT_DIR/lib/" \; 2>/dev/null || true
@@ -342,7 +327,6 @@ jobs:
           for lib in libffi liblzma libbz2 libsqlite3; do
             find /usr/lib -name "${lib}.so.*" -exec cp {} "$OUTPUT_DIR/lib/" \; 2>/dev/null || true
           done
-          # 不复制：libstdc++、libc、libm、libdl、libpthread（由系统提供）
           
           # 验证主二进制存在
           if [ ! -f "$OUTPUT_DIR/轻松评" ]; then
@@ -351,11 +335,10 @@ jobs:
             exit 1
           fi
           
-          # 修复6：生成带权限检查的启动脚本
+          # 生成启动脚本
           cat > "$OUTPUT_DIR/run.sh" << "RUN_SCRIPT"
           #!/bin/bash
           DIR="$(cd "$(dirname "$0")" && pwd)"
-          # 确保目录权限安全
           chmod 755 "$DIR" 2>/dev/null || true
           chmod 755 "$DIR/lib" 2>/dev/null || true
           export LD_LIBRARY_PATH="$DIR/lib:$DIR:$LD_LIBRARY_PATH"
